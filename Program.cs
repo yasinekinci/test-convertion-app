@@ -215,12 +215,17 @@ static string FormatBinary(byte[] bytes, string binaryMode)
             }, jsonOpts);
         }
 
+        var formatHint = error is not null &&
+                         error.Contains("not a valid binary format", StringComparison.OrdinalIgnoreCase)
+            ? "Stream BF header ile başlamıyor (framing/GZip?). İlk byte'lar kaymış olabilir."
+            : "libs klasöründeki DLL'ler eksik/uyumsuz olabilir (Entities + InterFrame.Messaging + bağımlılıkları).";
+
         return JsonSerializer.Serialize(new
         {
             format = "binary-formatter",
             error,
             length = bytes.Length,
-            hint = "libs klasöründeki DLL'ler eksik/uyumsuz olabilir (Entities + InterFrame.Messaging + bağımlılıkları)."
+            hint = formatHint
         }, jsonOpts);
     }
 
@@ -280,6 +285,11 @@ static class BinaryDeserializer
 
     public static void Initialize(string folder)
     {
+        // .NET 8'de BinaryFormatter runtime'da kapalı; DLL load yetmez, switch şart
+        AppContext.SetSwitch(
+            "System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization",
+            isEnabled: true);
+
         _folder = folder;
         Directory.CreateDirectory(folder);
 
@@ -312,18 +322,122 @@ static class BinaryDeserializer
     {
         obj = null;
         error = null;
+
+        var candidates = new List<byte[]> { bytes };
+        if (TryDecompress(bytes, out var decompressed) && decompressed.Length > 0)
+            candidates.Insert(0, decompressed);
+
+        Exception? lastError = null;
+        foreach (var payload in candidates)
+        {
+            // Bazı kayıtlarda BF header'dan önce 1-4 byte framing olabiliyor (örn. baştaki 0x0A).
+            foreach (var slice in EnumeratePayloadSlices(payload))
+            {
+                try
+                {
+                    using var ms = new MemoryStream(slice);
+                    var formatter = new BinaryFormatter();
+                    obj = formatter.Deserialize(ms);
+                    if (obj is not null)
+                        return true;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
+            }
+        }
+
+        error = lastError?.GetBaseException().Message ?? "deserialize failed";
+        return false;
+    }
+
+    private static IEnumerable<byte[]> EnumeratePayloadSlices(byte[] payload)
+    {
+        yield return payload;
+
+        for (var offset = 1; offset <= 4 && offset < payload.Length; offset++)
+        {
+            var slice = new byte[payload.Length - offset];
+            Buffer.BlockCopy(payload, offset, slice, 0, slice.Length);
+            yield return slice;
+        }
+
+        var headerOffset = IndexOfBinaryFormatterHeader(payload);
+        if (headerOffset > 4)
+        {
+            var slice = new byte[payload.Length - headerOffset];
+            Buffer.BlockCopy(payload, headerOffset, slice, 0, slice.Length);
+            yield return slice;
+        }
+    }
+
+    private static int IndexOfBinaryFormatterHeader(byte[] payload)
+    {
+        ReadOnlySpan<byte> marker = [0x00, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        var span = payload.AsSpan();
+        for (var i = 1; i <= span.Length - marker.Length; i++)
+        {
+            if (span[i..].StartsWith(marker))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static bool TryDecompress(byte[] bytes, out byte[] result)
+    {
+        result = [];
+
         try
         {
-            using var ms = new MemoryStream(bytes);
-            var formatter = new BinaryFormatter();
-            obj = formatter.Deserialize(ms);
-            return obj is not null;
+            var utilityType = Type.GetType(
+                "Intertech.Utility.Compression.GZip.Utility, Intertech.Utility",
+                throwOnError: false);
+            utilityType ??= AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("Intertech.Utility.Compression.GZip.Utility"))
+                .FirstOrDefault(t => t is not null);
+
+            var method = utilityType?.GetMethod(
+                "Decompress",
+                BindingFlags.Public | BindingFlags.Static,
+                binder: null,
+                types: [typeof(byte[])],
+                modifiers: null);
+
+            if (method is not null)
+            {
+                var decompressed = method.Invoke(null, [bytes]) as byte[];
+                if (decompressed is { Length: > 0 })
+                {
+                    result = decompressed;
+                    return true;
+                }
+            }
         }
-        catch (Exception ex)
+        catch
         {
-            error = ex.GetBaseException().Message;
-            return false;
+            // fallback aşağıda
         }
+
+        try
+        {
+            if (bytes.Length > 2 && bytes[0] == 0x1F && bytes[1] == 0x8B)
+            {
+                using var input = new MemoryStream(bytes);
+                using var gzip = new System.IO.Compression.GZipStream(input, System.IO.Compression.CompressionMode.Decompress);
+                using var output = new MemoryStream();
+                gzip.CopyTo(output);
+                result = output.ToArray();
+                return result.Length > 0;
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+
+        return false;
     }
 #pragma warning restore SYSLIB0011
 }
